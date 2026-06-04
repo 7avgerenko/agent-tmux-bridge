@@ -1,0 +1,176 @@
+#!/usr/bin/env bash
+# =============================================================================
+# bridge-daemon -- Background activity monitor for agent-shell-bridge
+# =============================================================================
+# Continuously polls the user pane's cursor position and prompt timestamps
+# to detect user typing activity. Writes status to a JSON file consumed by
+# bridge-status and bridge-send.
+# =============================================================================
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BRIDGE_HOME="$(cd "$SCRIPT_DIR/.." && pwd)"
+export BRIDGE_HOME
+
+source "$BRIDGE_HOME/lib/logging.sh"
+source "$BRIDGE_HOME/lib/config.sh"
+source "$BRIDGE_HOME/lib/tmux-helpers.sh"
+source "$BRIDGE_HOME/lib/activity.sh"
+
+# ---------------------------------------------------------------------------
+# Daemon lifecycle
+# ---------------------------------------------------------------------------
+
+DAEMON_PID_FILE=""
+DAEMON_RUNNING=true
+
+cleanup() {
+    log_info "Daemon shutting down (signal received)"
+    DAEMON_RUNNING=false
+    if [ -n "$DAEMON_PID_FILE" ] && [ -f "$DAEMON_PID_FILE" ]; then
+        rm -f "$DAEMON_PID_FILE"
+    fi
+    exit 0
+}
+
+trap cleanup SIGTERM SIGINT SIGHUP
+
+write_pid_file() {
+    DAEMON_PID_FILE="${BRIDGE_RUN_DIR}/daemon.pid"
+    echo $$ > "$DAEMON_PID_FILE"
+}
+
+# ---------------------------------------------------------------------------
+# Polling helpers
+# ---------------------------------------------------------------------------
+
+# Convert poll interval to seconds (with fractional part)
+poll_interval_sec() {
+    local ms="${POLL_INTERVAL_MS:-200}"
+    # Ensure minimum of 50ms, maximum of 2000ms
+    if [ "$ms" -lt 50 ]; then ms=50; fi
+    if [ "$ms" -gt 2000 ]; then ms=2000; fi
+    echo "scale=3; $ms / 1000" | bc 2>/dev/null || echo "0.2"
+}
+
+# Sleep for one poll interval (using bash's built-in sleep with fractional seconds)
+poll_sleep() {
+    local sec
+    sec=$(poll_interval_sec)
+    sleep "$sec" 2>/dev/null || sleep 0.2
+}
+
+# Check if agent is currently injecting
+check_agent_active() {
+    if [ -f "${BRIDGE_RUN_DIR}/agent_active" ]; then
+        echo "1"
+    else
+        echo "0"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Heartbeat: detect if daemon state is stale
+# ---------------------------------------------------------------------------
+
+check_heartbeat() {
+    # No-op for now; future: detect if user pane died, auto-repair
+    local user_pane
+    if ! user_pane=$(get_user_pane_id 2>/dev/null); then
+        log_error "User pane not found! Bridge may be broken."
+        # Don't exit -- user might reattach
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Main loop
+# ---------------------------------------------------------------------------
+
+daemon_main() {
+    log_info "Daemon starting for session '${BRIDGE_SESSION:-unknown}'"
+    log_info "  Run dir: ${BRIDGE_RUN_DIR}"
+    log_info "  Poll interval: ${POLL_INTERVAL_MS:-200}ms"
+    log_info "  Cooldown: ${COOLDOWN_SECONDS:-5}s"
+    log_info "  Activity detection: ${ACTIVITY_DETECTION:-auto}"
+
+    # Ensure run directories exist
+    mkdir -p "${BRIDGE_RUN_DIR}/log"
+
+    write_pid_file
+
+    # Initialize activity state
+    activity_init
+    activity_write_status
+
+    local cycle=0
+    while [ "$DAEMON_RUNNING" = true ]; do
+        poll_sleep
+        cycle=$((cycle + 1))
+
+        # Periodic heartbeat checks (every ~50 cycles = ~10s at 200ms)
+        if [ $((cycle % 50)) -eq 0 ]; then
+            check_heartbeat
+            rotate_logs_if_needed
+        fi
+
+        # Gather inputs
+        local cursor
+        cursor=$(read_cursor 2>/dev/null || echo "0 0")
+        local cx cy
+        cx=$(echo "$cursor" | awk '{print $1}')
+        cy=$(echo "$cursor" | awk '{print $2}')
+
+        local prompt_time
+        prompt_time=$(read_prompt_timestamp 2>/dev/null || echo "0")
+
+        local agent_active
+        agent_active=$(check_agent_active)
+
+        local now_ns
+        now_ns=$(date +%s%N 2>/dev/null || echo 0)
+
+        # Update state machine
+        activity_update "$cx" "$cy" "$prompt_time" "$agent_active" "$now_ns"
+
+        # Write status (throttled: every cycle for now, state machine is cheap)
+        activity_write_status
+
+        # Debug logging every 50 cycles to avoid spam
+        if [ $((cycle % 50)) -eq 0 ]; then
+            local blocked
+            blocked=$(activity_is_blocked)
+            log_debug "Cycle $cycle: cursor=($cx,$cy) prompt=$prompt_time blocked=$blocked at_prompt=$ACTIVITY_USER_AT_PROMPT"
+        fi
+    done
+}
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+# Validate that we have a session
+if [ -z "${BRIDGE_SESSION:-}" ]; then
+    echo "ERROR: BRIDGE_SESSION is not set. Run 'bridge init' first." >&2
+    exit 1
+fi
+
+if [ -z "${BRIDGE_RUN_DIR:-}" ]; then
+    echo "ERROR: BRIDGE_RUN_DIR is not set." >&2
+    exit 1
+fi
+
+# Prevent multiple daemons for the same session
+if [ -f "${BRIDGE_RUN_DIR}/daemon.pid" ]; then
+    local existing_pid
+    existing_pid=$(cat "${BRIDGE_RUN_DIR}/daemon.pid" 2>/dev/null)
+    if [ -n "$existing_pid" ] && kill -0 "$existing_pid" 2>/dev/null; then
+        log_warn "Daemon already running for session ${BRIDGE_SESSION} (PID $existing_pid)"
+        exit 0
+    else
+        log_info "Removing stale PID file"
+        rm -f "${BRIDGE_RUN_DIR}/daemon.pid"
+    fi
+fi
+
+daemon_main

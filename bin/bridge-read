@@ -1,0 +1,164 @@
+#!/usr/bin/env bash
+# =============================================================================
+# bridge-read -- Capture content from the user's shell
+# =============================================================================
+# Reads the user pane's buffer (visible screen, scrollback, or last N lines)
+# and outputs it with ANSI escape codes optionally stripped.
+# =============================================================================
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BRIDGE_HOME="$(cd "$SCRIPT_DIR/.." && pwd)"
+export BRIDGE_HOME
+
+source "$BRIDGE_HOME/lib/logging.sh"
+source "$BRIDGE_HOME/lib/config.sh"
+source "$BRIDGE_HOME/lib/tmux-helpers.sh"
+source "$BRIDGE_HOME/lib/capture.sh"
+
+# ---------------------------------------------------------------------------
+# Usage
+# ---------------------------------------------------------------------------
+
+usage() {
+    cat <<'EOF'
+bridge read -- Capture content from the user shell
+
+USAGE:
+  bridge read [options]
+
+OPTIONS:
+  --last N            Capture the last N lines (default: visible only)
+  --full              Capture the entire scrollback buffer
+  --visible           Capture only the visible portion (default)
+  --since PATTERN     Capture content since last occurrence of PATTERN
+  --raw               Do not strip ANSI escape codes
+  --no-strip          Same as --raw
+  --output FILE       Write output to FILE instead of stdout
+  --help              Show this help
+
+EXAMPLES:
+  bridge read                    # Visible screen content
+  bridge read --last 50          # Last 50 lines
+  bridge read --full             # Entire scrollback
+  bridge read --since "ERROR"    # Content since last ERROR
+  bridge read --raw --last 20    # Last 20 lines with ANSI codes
+EOF
+}
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+main() {
+    local mode="visible"
+    local n_lines=0
+    local pattern=""
+    local raw_mode=false
+    local output_file=""
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --last|-n)
+                mode="last"
+                n_lines="$2"
+                shift 2
+                ;;
+            --full|-f)
+                mode="full"
+                shift
+                ;;
+            --visible|-v)
+                mode="visible"
+                shift
+                ;;
+            --since|-s)
+                mode="since"
+                pattern="$2"
+                shift 2
+                ;;
+            --raw|--no-strip)
+                raw_mode=true
+                shift
+                ;;
+            --output|-o)
+                output_file="$2"
+                shift 2
+                ;;
+            --help|-h)
+                usage
+                exit 0
+                ;;
+            *)
+                echo "bridge read: unknown option '$1'" >&2
+                usage
+                exit 1
+                ;;
+        esac
+    done
+
+    # Override ANSI stripping if raw mode
+    if [ "$raw_mode" = true ]; then
+        STRIP_ANSI="false"
+        STRIP_OSC="false"
+    fi
+
+    # Check if bridge is initialized
+    if [ -z "${BRIDGE_SESSION:-}" ] && [ -z "${BRIDGE_RUN_DIR:-}" ]; then
+        # Try to auto-discover
+        if session_info=$(cat /tmp/bridge/*/session_name 2>/dev/null | head -1); then
+            BRIDGE_SESSION="$session_info"
+            BRIDGE_RUN_DIR="/tmp/bridge/$BRIDGE_SESSION"
+        fi
+    fi
+
+    # Verify user pane exists
+    local user_pane
+    if ! user_pane=$(get_user_pane_id 2>/dev/null); then
+        echo "bridge read: cannot find user pane. Is the bridge initialized?" >&2
+        echo "Run 'bridge init' to create a session." >&2
+        exit 1
+    fi
+
+    # Capture content
+    local content
+    case "$mode" in
+        full)
+            content=$(capture_full)
+            ;;
+        visible)
+            content=$(capture_visible)
+            ;;
+        last)
+            content=$(capture_last_n "$n_lines")
+            ;;
+        since)
+            content=$(capture_since "$pattern")
+            ;;
+    esac
+
+    # Process (strip ANSI/OSC unless raw)
+    if [ "$raw_mode" != true ]; then
+        content=$(echo "$content" | process_capture)
+    fi
+
+    # Truncate if too large
+    local max_lines="${READ_MAX_LINES:-10000}"
+    local line_count
+    line_count=$(echo "$content" | wc -l)
+    if [ "$line_count" -gt "$max_lines" ]; then
+        content=$(echo "$content" | tail -n "$max_lines")
+        log_warn "Output truncated from $line_count to $max_lines lines"
+    fi
+
+    # Output
+    if [ -n "$output_file" ]; then
+        echo "$content" > "$output_file"
+        log_info "Written $line_count lines to $output_file"
+    else
+        echo "$content"
+    fi
+}
+
+main "$@"

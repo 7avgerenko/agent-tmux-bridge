@@ -1,0 +1,240 @@
+#!/usr/bin/env bash
+# =============================================================================
+# bridge-status -- Query the state of the agent-shell-bridge
+# =============================================================================
+# Reads the daemon's status file and outputs bridge state.
+# Can block until the user is idle (cooldown expired).
+# =============================================================================
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BRIDGE_HOME="$(cd "$SCRIPT_DIR/.." && pwd)"
+export BRIDGE_HOME
+
+source "$BRIDGE_HOME/lib/logging.sh"
+source "$BRIDGE_HOME/lib/config.sh"
+source "$BRIDGE_HOME/lib/tmux-helpers.sh"
+
+# ---------------------------------------------------------------------------
+# Usage
+# ---------------------------------------------------------------------------
+
+usage() {
+    cat <<'EOF'
+bridge status -- Query bridge state
+
+USAGE:
+  bridge status [options]
+
+OPTIONS:
+  --json              Output status as JSON
+  --wait SECONDS      Wait up to SECONDS for bridge to become unblocked
+  --watch             Continuously output status changes (for UIs)
+  --help              Show this help
+
+Without options, prints a human-readable status line.
+
+EXIT CODES:
+  0   Bridge is ready (not blocked)
+  1   Bridge is blocked (user typing within cooldown)
+  2   Bridge is not initialized / daemon not running
+EOF
+}
+
+# ---------------------------------------------------------------------------
+# Status reading
+# ---------------------------------------------------------------------------
+
+# Read the daemon status file
+read_status_file() {
+    local status_file="${BRIDGE_RUN_DIR:-/tmp/bridge/unknown}/daemon.status"
+    if [ ! -f "$status_file" ]; then
+        return 1
+    fi
+    cat "$status_file"
+}
+
+# ---------------------------------------------------------------------------
+# Output formats
+# ---------------------------------------------------------------------------
+
+print_human_status() {
+    if ! daemon_running; then
+        echo "bridge: not initialized (daemon not running)"
+        echo "Run 'bridge init' to create a session."
+        return 2
+    fi
+
+    local status_json
+    if ! status_json=$(read_status_file); then
+        echo "bridge: no status data available"
+        return 2
+    fi
+
+    local blocked remaining integration
+    blocked=$(echo "$status_json" | grep -o '"blocked": [a-z]*' | awk '{print $2}')
+    remaining=$(echo "$status_json" | grep -o '"remaining_cooldown_ms": [0-9]*' | awk '{print $2}')
+    integration=$(echo "$status_json" | grep -o '"shell_integration_active": [a-z]*' | awk '{print $2}')
+
+    if [ "$blocked" = "true" ]; then
+        local remaining_sec=$((remaining / 1000))
+        echo "bridge: BLOCKED (cooldown: ~${remaining_sec}s remaining)"
+        echo "  user typing detected within the last ${COOLDOWN_SECONDS:-5}s"
+        return 1
+    else
+        echo "bridge: READY"
+        if [ "$integration" = "true" ]; then
+            echo "  shell integration: active"
+        else
+            echo "  shell integration: inactive (cursor-only detection)"
+        fi
+        return 0
+    fi
+}
+
+print_json_status() {
+    if ! daemon_running; then
+        echo '{"error":"daemon not running","initialized":false}'
+        return 2
+    fi
+
+    local status_json
+    if ! status_json=$(read_status_file); then
+        echo '{"error":"no status data","initialized":false}'
+        return 2
+    fi
+
+    # Add initialization flag and daemon status
+    local daemon_ok="false"
+    if daemon_running; then daemon_ok="true"; fi
+
+    # Merge in extra fields
+    echo "$status_json" | sed 's/}$//'
+    echo ','
+    echo "  \"initialized\": true,"
+    echo "  \"daemon_running\": $daemon_ok"
+    echo '}'
+}
+
+# ---------------------------------------------------------------------------
+# Wait mode
+# ---------------------------------------------------------------------------
+
+wait_for_ready() {
+    local max_wait="$1"
+    local start_time
+    start_time=$(date +%s)
+    local poll_interval=0.2
+
+    while true; do
+        local status_json blocked
+        if status_json=$(read_status_file 2>/dev/null); then
+            blocked=$(echo "$status_json" | grep -o '"blocked": [a-z]*' | awk '{print $2}')
+            if [ "$blocked" != "true" ]; then
+                # Ready!
+                return 0
+            fi
+        fi
+
+        # Check timeout
+        local now elapsed
+        now=$(date +%s)
+        elapsed=$((now - start_time))
+        if [ "$elapsed" -ge "$max_wait" ]; then
+            return 1
+        fi
+
+        sleep "$poll_interval"
+    done
+}
+
+# ---------------------------------------------------------------------------
+# Watch mode
+# ---------------------------------------------------------------------------
+
+watch_status() {
+    local last_blocked=""
+
+    while true; do
+        local status_json blocked
+        if status_json=$(read_status_file 2>/dev/null); then
+            blocked=$(echo "$status_json" | grep -o '"blocked": [a-z]*' | awk '{print $2}')
+            if [ "$blocked" != "$last_blocked" ]; then
+                local ts
+                ts=$(date '+%H:%M:%S')
+                if [ "$blocked" = "true" ]; then
+                    echo "[$ts] BLOCKED"
+                else
+                    echo "[$ts] READY"
+                fi
+                last_blocked="$blocked"
+            fi
+        fi
+        sleep 0.5
+    done
+}
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+main() {
+    local mode="human"
+    local wait_seconds=0
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --json|-j)
+                mode="json"
+                shift
+                ;;
+            --wait|-w)
+                wait_seconds="$2"
+                shift 2
+                ;;
+            --watch)
+                mode="watch"
+                shift
+                ;;
+            --help|-h)
+                usage
+                exit 0
+                ;;
+            *)
+                echo "bridge status: unknown option '$1'" >&2
+                usage
+                exit 1
+                ;;
+        esac
+    done
+
+    # Handle wait mode
+    if [ "$wait_seconds" -gt 0 ]; then
+        if wait_for_ready "$wait_seconds"; then
+            mode="${mode}"  # proceed to output
+        else
+            if [ "$mode" = "json" ]; then
+                echo '{"blocked":true,"reason":"timeout waiting for ready"}'
+            else
+                echo "bridge: still BLOCKED after ${wait_seconds}s"
+            fi
+            exit 1
+        fi
+    fi
+
+    # Output
+    case "$mode" in
+        json)
+            print_json_status
+            ;;
+        watch)
+            watch_status
+            ;;
+        human)
+            print_human_status
+            ;;
+    esac
+}
+
+main "$@"

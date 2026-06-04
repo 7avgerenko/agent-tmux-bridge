@@ -1,0 +1,266 @@
+#!/usr/bin/env bash
+# =============================================================================
+# bridge-send -- Inject a command into the user's shell
+# =============================================================================
+# The primary interface for an AI agent to suggest commands to the user.
+#
+# Pipeline:
+#   1. Validate the bridge is initialized and daemon is running
+#   2. Check cooldown gate (is user actively typing?)
+#   3. Check pane state (is user in vim/copy-mode/etc?)
+#   4. Run EXTERNAL validator (return 0=allow, non-0=reject)
+#   5. Inject command via tmux send-keys (user presses Enter)
+#
+# The validator is the KEY safety mechanism. Claude Code (or any AI agent)
+# is NOT trusted to self-police its commands — an external validator
+# executable independently approves or rejects each command.
+# =============================================================================
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BRIDGE_HOME="$(cd "$SCRIPT_DIR/.." && pwd)"
+export BRIDGE_HOME
+
+source "$BRIDGE_HOME/lib/logging.sh"
+source "$BRIDGE_HOME/lib/config.sh"
+source "$BRIDGE_HOME/lib/tmux-helpers.sh"
+source "$BRIDGE_HOME/lib/validator.sh"
+source "$BRIDGE_HOME/lib/injection.sh"
+
+# ---------------------------------------------------------------------------
+# Usage
+# ---------------------------------------------------------------------------
+
+usage() {
+    cat <<'EOF'
+bridge send -- Inject a command into the user shell
+
+USAGE:
+  bridge send [options] <command>
+
+OPTIONS:
+  --yes, -y                  Auto-execute (press Enter after typing)
+                             Default: interactive mode (user presses Enter)
+  --no-interactive            Same as --yes
+  --skip-validator            Bypass the validator (use with caution)
+  --dry-run                   Show what would be injected without doing it
+  --allow-malicious-access    DISABLE Layer 1 pre-sanitization
+                             ⚠️  DO NOT USE — allows control chars,
+                             newlines, and Unicode attacks through
+  --help                      Show this help
+
+VALIDATOR:
+  The validator is configured via VALIDATOR in config or BRIDGE_VALIDATOR env.
+  It is an EXTERNAL executable that receives the command and returns:
+    exit 0 = ALLOW (command may be injected)
+    exit non-0 = REJECT (command blocked)
+
+  Two modes are supported:
+  1. stdin mode:  echo "command" | ./validator.sh
+  2. template mode: VALIDATOR="./check.py --input {}"
+     The {} is replaced with the command text.
+
+EXAMPLES:
+  bridge send "git status"               # Suggest a command (user Enter)
+  bridge send "npm run build"            # Suggest a build command
+  bridge send --yes "echo hello"         # Auto-execute (bypasses user)
+  bridge send --dry-run "rm -rf /"       # Check what validator would do
+EOF
+}
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+main() {
+    local auto_enter="false"
+    local skip_validator="false"
+    local dry_run="false"
+    local allow_malicious_access="false"
+    local command=""
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --yes|-y|--no-interactive)
+                auto_enter="true"
+                shift
+                ;;
+            --skip-validator)
+                skip_validator="true"
+                shift
+                ;;
+            --dry-run)
+                dry_run="true"
+                shift
+                ;;
+            --allow-malicious-access)
+                allow_malicious_access="true"
+                shift
+                ;;
+            --help|-h)
+                usage
+                exit 0
+                ;;
+            --)
+                shift
+                command="${*:-}"
+                break
+                ;;
+            -*)
+                echo "bridge send: unknown option '$1'" >&2
+                usage
+                exit 1
+                ;;
+            *)
+                # Everything else is the command
+                command="${*:-}"
+                break
+                ;;
+        esac
+    done
+
+    if [ -z "$command" ]; then
+        echo "bridge send: no command specified" >&2
+        echo "Usage: bridge send [options] <command>" >&2
+        exit 1
+    fi
+
+    # Auto-discover bridge session if not set
+    if [ -z "${BRIDGE_SESSION:-}" ]; then
+        local found
+        found=$(cat /tmp/bridge/*/session_name 2>/dev/null | head -1)
+        if [ -n "$found" ]; then
+            BRIDGE_SESSION="$found"
+            BRIDGE_RUN_DIR="/tmp/bridge/$BRIDGE_SESSION"
+        fi
+    fi
+
+    # Check if bridge is initialized
+    if [ -z "${BRIDGE_RUN_DIR:-}" ] || [ ! -d "$BRIDGE_RUN_DIR" ]; then
+        echo "bridge send: bridge not initialized. Run 'bridge init' first." >&2
+        exit 1
+    fi
+
+    # Check if daemon is running
+    if ! daemon_running 2>/dev/null; then
+        echo "bridge send: daemon not running. Run 'bridge init' to restart." >&2
+        exit 1
+    fi
+
+    # --- Validator lock enforcement ---
+    # Read the validator configured at init time. This CANNOT be overridden
+    # by environment variables — the lock file is the source of truth.
+    # This prevents the LLM agent from doing:
+    #   unset VALIDATOR; bridge send "rm -rf /"
+    #   BRIDGE_VALIDATOR=true bridge send "rm -rf /"
+    local validator_state="${BRIDGE_RUN_DIR}/validator_state"
+    local validator_lock="${BRIDGE_RUN_DIR}/validator_lock"
+    if [ -f "$validator_state" ]; then
+        local state
+        state=$(cat "$validator_state" 2>/dev/null)
+        if [ "$state" = "locked" ] && [ -f "$validator_lock" ]; then
+            # Locked: use the init-time validator, ignore env overrides
+            VALIDATOR=$(cat "$validator_lock" 2>/dev/null)
+            export VALIDATOR
+            log_debug "Validator enforced from lock: $VALIDATOR"
+        elif [ "$state" = "none" ]; then
+            # Intentionally no validator — but pre-sanitization still runs
+            VALIDATOR=""
+            export VALIDATOR
+            log_debug "Validator: none (pre-sanitization only)"
+        fi
+    fi
+    # If no lock file exists (legacy), VALIDATOR from env/config is used as-is
+
+    # --- --allow-malicious-access handling ---
+    if [ "$allow_malicious_access" = "true" ]; then
+        export ALLOW_MALICIOUS_ACCESS=1
+        cat >&2 <<'WARN'
+
+╔══════════════════════════════════════════════════════════════╗
+║  ⚠️  --allow-malicious-access ENABLED                       ║
+║                                                              ║
+║  Layer 1 pre-sanitization is DISABLED.                       ║
+║  Control characters, newlines, null bytes, and Unicode       ║
+║  attacks will NOT be blocked before reaching send-keys.      ║
+║                                                              ║
+║  A malicious or compromised LLM can now:                     ║
+║    • Inject newlines → auto-execute commands                 ║
+║    • Send Ctrl+C → kill foreground processes                 ║
+║    • Send Ctrl+D → close your shell                          ║
+║    • Use ANSI escapes → hide commands visually               ║
+║                                                              ║
+║  YOU HAVE BEEN WARNED. Do not use this flag unless you       ║
+║  have compensating controls and understand the risks.        ║
+╚══════════════════════════════════════════════════════════════╝
+
+WARN
+    fi
+
+    # Set injection mode
+    INTERACTIVE_MODE="$([ "$auto_enter" = "true" ] && echo "false" || echo "true")"
+
+    # Dry run: just show what would happen
+    if [ "$dry_run" = true ]; then
+        echo "=== DRY RUN ==="
+        echo "Command: $command"
+        echo "Interactive: $INTERACTIVE_MODE"
+        echo ""
+
+        # Check cooldown
+        if check_cooldown_gate; then
+            echo "Cooldown gate: PASS (user idle)"
+        else
+            echo "Cooldown gate: BLOCKED (user typing recently)"
+        fi
+
+        # Check pane state
+        if check_pane_state; then
+            echo "Pane state:     PASS"
+        else
+            echo "Pane state:     BLOCKED"
+        fi
+
+        # Check validator
+        if [ "$skip_validator" != "true" ] && has_validator; then
+            echo "Validator:      $VALIDATOR"
+            local val_output val_rc
+            val_output=$(run_validator "$command")
+            val_rc=$?
+            if [ $val_rc -eq 0 ]; then
+                echo "Validator:      PASS (command: $val_output)"
+            else
+                echo "Validator:      REJECTED: $val_output"
+            fi
+        else
+            echo "Validator:      SKIPPED"
+        fi
+        echo "=== END DRY RUN ==="
+        exit 0
+    fi
+
+    # Temporarily disable validator if requested
+    if [ "$skip_validator" = "true" ]; then
+        local saved_validator="$VALIDATOR"
+        VALIDATOR=""
+    fi
+
+    # Run the send pipeline
+    local result result_rc
+    result=$(send_command "$command")
+    result_rc=$?
+
+    # Restore validator
+    if [ "$skip_validator" = "true" ]; then
+        VALIDATOR="$saved_validator"
+    fi
+
+    # Output result
+    echo "$result"
+
+    # Exit with the pipeline's exit code
+    exit $result_rc
+}
+
+main "$@"

@@ -1,0 +1,488 @@
+#!/usr/bin/env bash
+# =============================================================================
+# bridge-init -- Create and configure a bridge tmux session
+# =============================================================================
+# Creates a new tmux session (or window) with two panes:
+#   - User pane (left/top): normal interactive shell
+#   - Agent pane (right/bottom): shell for running the AI agent
+#
+# Injects shell integration into the user pane so the daemon can track
+# when prompts appear (distinguishing user typing from command output).
+# =============================================================================
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BRIDGE_HOME="$(cd "$SCRIPT_DIR/.." && pwd)"
+export BRIDGE_HOME
+
+source "$BRIDGE_HOME/lib/logging.sh"
+source "$BRIDGE_HOME/lib/config.sh"
+source "$BRIDGE_HOME/lib/tmux-helpers.sh"
+
+# ---------------------------------------------------------------------------
+# Argument parsing
+# ---------------------------------------------------------------------------
+
+parse_args() {
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --name|-n)
+                SESSION_NAME="$2"
+                shift 2
+                ;;
+            --vertical|-v)
+                LAYOUT="vertical"
+                shift
+                ;;
+            --horizontal|-h)
+                LAYOUT="horizontal"
+                shift
+                ;;
+            --user-shell)
+                USER_SHELL="$2"
+                shift 2
+                ;;
+            --agent-shell)
+                AGENT_SHELL="$2"
+                shift 2
+                ;;
+            --cooldown)
+                COOLDOWN_SECONDS="$2"
+                shift 2
+                ;;
+            --validator)
+                VALIDATOR="$2"
+                shift 2
+                ;;
+            --attach|-a)
+                ATTACH_AFTER="true"
+                shift
+                ;;
+            --no-attach)
+                ATTACH_AFTER="false"
+                shift
+                ;;
+            --session|-t)
+                TARGET_SESSION="$2"
+                shift 2
+                ;;
+            --help)
+                cat <<'HELP'
+bridge init -- Create a new bridge session
+
+USAGE:
+  bridge init [options]
+
+OPTIONS:
+  --name, -n NAME       New session name (default: agent-shell-bridge)
+  --session, -t NAME    Attach to an EXISTING tmux session instead of
+                        creating a new one. A new window with two panes
+                        is created in the target session.
+  --vertical, -v        Vertical split (default: horizontal)
+  --horizontal, -h      Horizontal split
+  --user-shell SHELL    Shell for user pane (default: $SHELL)
+  --agent-shell SHELL   Shell for agent pane (default: $SHELL)
+  --cooldown SECONDS    Cooldown after user typing (default: 5)
+  --validator PATH      Validator executable (default: allow-all)
+  --attach, -a          Attach to session after creation (default: true)
+  --no-attach           Don't attach after creation
+  --help                Show this help
+
+The validator is an external executable that receives commands and returns
+exit code 0 (allow) or non-zero (reject). See config/sanitizers/ for examples.
+HELP
+                exit 0
+                ;;
+            *)
+                echo "bridge init: unknown option '$1'" >&2
+                exit 1
+                ;;
+        esac
+    done
+}
+
+ATTACH_AFTER="${ATTACH_AFTER:-true}"
+
+# ---------------------------------------------------------------------------
+# Shell detection
+# ---------------------------------------------------------------------------
+
+detect_shell() {
+    local which_shell="${1:-}"
+    if [ -n "$which_shell" ]; then
+        echo "$which_shell"
+        return
+    fi
+    # Use the user's current shell
+    echo "${SHELL:-/bin/bash}"
+}
+
+# Determine which shell integration to use based on shell binary name
+detect_integration() {
+    local shell_bin="$1"
+    local shell_name
+    shell_name=$(basename "$shell_bin")
+
+    case "$shell_name" in
+        bash|bash-*)
+            echo "bash"
+            ;;
+        zsh|zsh-*)
+            echo "zsh"
+            ;;
+        fish|fish-*)
+            echo "fish"
+            ;;
+        *)
+            echo "bash"  # default fallback
+            ;;
+    esac
+}
+
+# ---------------------------------------------------------------------------
+# Session creation
+# ---------------------------------------------------------------------------
+
+create_session() {
+    local user_shell agent_shell session_name
+    user_shell=$(detect_shell "$USER_SHELL")
+    agent_shell=$(detect_shell "$AGENT_SHELL")
+
+    # Session name resolution order:
+    #   1. Explicit --name flag          → use it as-is
+    #   2. Explicit TMUX_SESSION_NAME    → use it as-is
+    #   3. Both empty                    → auto-generate: bridge-<uuid>
+    if [ -n "${SESSION_NAME:-}" ]; then
+        session_name="$SESSION_NAME"
+    elif [ -n "${TMUX_SESSION_NAME:-}" ]; then
+        session_name="$TMUX_SESSION_NAME"
+    else
+        # Auto-generate unique name with a short UUID
+        local uuid
+        if [ -f /proc/sys/kernel/random/uuid ]; then
+            uuid=$(cut -c1-8 < /proc/sys/kernel/random/uuid)
+        elif command -v uuidgen &>/dev/null; then
+            uuid=$(uuidgen | cut -c1-8)
+        else
+            # Fallback: bash $RANDOM-based 8-char hex
+            uuid=$(printf '%04x%04x' $RANDOM $RANDOM)
+        fi
+        session_name="bridge-${uuid}"
+    fi
+
+    # Propagate the resolved name so setup_environment / attach_session use it
+    SESSION_NAME="$session_name"
+
+    # ------------------------------------------------------------------
+    # Mode A: Attach to an existing session (--session / -t)
+    # ------------------------------------------------------------------
+    if [ -n "${TARGET_SESSION:-}" ]; then
+        if ! tmux has-session -t "$TARGET_SESSION" 2>/dev/null; then
+            log_error "Target session '$TARGET_SESSION' does not exist."
+            log_error "Available sessions:"
+            tmux list-sessions -F '  #{session_name}' 2>/dev/null || true
+            exit 1
+        fi
+
+        log_info "Attaching to existing session: $TARGET_SESSION"
+        log_info "  Layout: $LAYOUT (user=${USER_PANE_SIZE}% agent=${AGENT_PANE_SIZE}%)"
+
+        # Create a new window in the target session
+        local window_name="bridge-${session_name}"
+        tmux new-window -t "$TARGET_SESSION" -n "$window_name" -c "$(pwd)" "$user_shell"
+        local new_window
+        new_window=$(tmux display-message -p -t "$TARGET_SESSION" '#{window_id}' 2>/dev/null)
+
+        # Split for agent pane
+        if [ "$LAYOUT" = "vertical" ]; then
+            tmux split-window -v -t "$new_window" -c "$(pwd)" -p "$AGENT_PANE_SIZE" "$agent_shell"
+        else
+            tmux split-window -h -t "$new_window" -c "$(pwd)" -p "$AGENT_PANE_SIZE" "$agent_shell"
+        fi
+
+        # Identify panes
+        BRIDGE_USER_PANE=$(tmux list-panes -t "$new_window" -F '#{pane_id}' | head -1)
+        BRIDGE_AGENT_PANE=$(tmux list-panes -t "$new_window" -F '#{pane_id}' | tail -1)
+
+        # Bridge session name is the target session
+        SESSION_NAME="$TARGET_SESSION"
+
+        log_info "User pane: $BRIDGE_USER_PANE"
+        log_info "Agent pane: $BRIDGE_AGENT_PANE"
+        return 0
+    fi
+
+    # ------------------------------------------------------------------
+    # Mode B: Create a new session or window
+    # ------------------------------------------------------------------
+
+    # Check if session already exists
+    if tmux has-session -t "$session_name" 2>/dev/null; then
+        log_warn "Session '$session_name' already exists."
+        if [ "${BRIDGE_RECREATE:-false}" = "true" ]; then
+            log_info "Killing existing session (BRIDGE_RECREATE=true)"
+            tmux kill-session -t "$session_name" 2>/dev/null
+        else
+            log_info "Attaching to existing session. Use BRIDGE_RECREATE=true to recreate."
+            if [ "$ATTACH_AFTER" = "true" ]; then
+                attach_session "$session_name"
+            fi
+            return 0
+        fi
+    fi
+
+    # Detect if we're already inside tmux
+    local in_tmux=false
+    if [ -n "${TMUX:-}" ]; then
+        in_tmux=true
+    fi
+
+    log_info "Creating bridge session: $session_name"
+    log_info "  Layout: $LAYOUT (user=${USER_PANE_SIZE}% agent=${AGENT_PANE_SIZE}%)"
+    log_info "  User shell: $user_shell"
+    log_info "  Agent shell: $agent_shell"
+    log_info "  Cooldown: ${COOLDOWN_SECONDS}s"
+    log_info "  Inside tmux: $in_tmux"
+
+    if [ "$in_tmux" = true ]; then
+        # Create a new window in the current session
+        local window_name="bridge-${session_name}"
+        tmux new-window -n "$window_name" -c "$(pwd)" "$user_shell"
+        local new_window
+        new_window=$(tmux display-message -p '#{window_id}')
+
+        # Split for agent pane
+        if [ "$LAYOUT" = "vertical" ]; then
+            tmux split-window -v -t "$new_window" -c "$(pwd)" -p "$AGENT_PANE_SIZE" "$agent_shell"
+        else
+            tmux split-window -h -t "$new_window" -c "$(pwd)" -p "$AGENT_PANE_SIZE" "$agent_shell"
+        fi
+
+        # Identify panes
+        local pane1 pane2
+        pane1=$(tmux list-panes -t "$new_window" -F '#{pane_id}' | head -1)
+        pane2=$(tmux list-panes -t "$new_window" -F '#{pane_id}' | tail -1)
+
+        BRIDGE_USER_PANE="$pane1"
+        BRIDGE_AGENT_PANE="$pane2"
+    else
+        # Create a new detached session
+        tmux new-session -d -s "$session_name" -c "$(pwd)" "$user_shell"
+
+        # Split for agent pane
+        if [ "$LAYOUT" = "vertical" ]; then
+            tmux split-window -v -t "$session_name:0" -c "$(pwd)" -p "$AGENT_PANE_SIZE" "$agent_shell"
+        else
+            tmux split-window -h -t "$session_name:0" -c "$(pwd)" -p "$AGENT_PANE_SIZE" "$agent_shell"
+        fi
+
+        # Identify panes
+        BRIDGE_USER_PANE=$(tmux list-panes -t "$session_name:0" -F '#{pane_id}' | head -1)
+        BRIDGE_AGENT_PANE=$(tmux list-panes -t "$session_name:0" -F '#{pane_id}' | tail -1)
+    fi
+
+    log_info "User pane: $BRIDGE_USER_PANE"
+    log_info "Agent pane: $BRIDGE_AGENT_PANE"
+}
+
+# ---------------------------------------------------------------------------
+# Pane configuration
+# ---------------------------------------------------------------------------
+
+configure_panes() {
+    # Set pane titles for identification
+    tmux select-pane -t "$BRIDGE_USER_PANE" -T "user-pane" 2>/dev/null || true
+    tmux select-pane -t "$BRIDGE_AGENT_PANE" -T "agent-pane" 2>/dev/null || true
+
+    # Enable activity monitoring on user pane
+    tmux set-window-option -t "$BRIDGE_USER_PANE" monitor-activity on 2>/dev/null || true
+}
+
+# ---------------------------------------------------------------------------
+# Shell integration injection
+# ---------------------------------------------------------------------------
+
+inject_shell_integration() {
+    local user_shell integration_type
+    user_shell=$(detect_shell "$USER_SHELL")
+    integration_type=$(detect_integration "$user_shell")
+
+    local integration_file="$BRIDGE_HOME/shell-integrations/${integration_type}-integration.sh"
+
+    if [ ! -f "$integration_file" ]; then
+        log_warn "No shell integration found for $integration_type, using bash"
+        integration_file="$BRIDGE_HOME/shell-integrations/bash-integration.sh"
+    fi
+
+    log_info "Injecting shell integration: $integration_type ($integration_file)"
+
+    # Source the integration into the user's shell
+    # We send the source command and a newline
+    local source_cmd="source '$integration_file'"
+    tmux send-keys -t "$BRIDGE_USER_PANE" "$source_cmd" Enter
+
+    # Small delay to let the shell process it
+    sleep 0.3
+}
+
+# ---------------------------------------------------------------------------
+# Environment setup
+# ---------------------------------------------------------------------------
+
+setup_environment() {
+    local session_name="${SESSION_NAME:-bridge-unknown}"
+    BRIDGE_SESSION="$session_name"
+    BRIDGE_RUN_DIR="/tmp/bridge/$BRIDGE_SESSION"
+
+    # Create run directory
+    mkdir -p "$BRIDGE_RUN_DIR/log"
+
+    # Export environment to both panes via tmux
+    tmux set-environment -t "$BRIDGE_USER_PANE" BRIDGE_SESSION "$BRIDGE_SESSION" 2>/dev/null || true
+    tmux set-environment -t "$BRIDGE_USER_PANE" BRIDGE_RUN_DIR "$BRIDGE_RUN_DIR" 2>/dev/null || true
+    tmux set-environment -t "$BRIDGE_USER_PANE" BRIDGE_USER_PANE "$BRIDGE_USER_PANE" 2>/dev/null || true
+    tmux set-environment -t "$BRIDGE_USER_PANE" BRIDGE_AGENT_PANE "$BRIDGE_AGENT_PANE" 2>/dev/null || true
+    tmux set-environment -t "$BRIDGE_USER_PANE" BRIDGE_HOME "$BRIDGE_HOME" 2>/dev/null || true
+
+    tmux set-environment -t "$BRIDGE_AGENT_PANE" BRIDGE_SESSION "$BRIDGE_SESSION" 2>/dev/null || true
+    tmux set-environment -t "$BRIDGE_AGENT_PANE" BRIDGE_RUN_DIR "$BRIDGE_RUN_DIR" 2>/dev/null || true
+    tmux set-environment -t "$BRIDGE_AGENT_PANE" BRIDGE_USER_PANE "$BRIDGE_USER_PANE" 2>/dev/null || true
+    tmux set-environment -t "$BRIDGE_AGENT_PANE" BRIDGE_AGENT_PANE "$BRIDGE_AGENT_PANE" 2>/dev/null || true
+    tmux set-environment -t "$BRIDGE_AGENT_PANE" BRIDGE_HOME "$BRIDGE_HOME" 2>/dev/null || true
+
+    # Also add bridge to PATH in agent pane
+    local path_cmd="export PATH=\"$BRIDGE_HOME/bin:\$PATH\""
+    tmux send-keys -t "$BRIDGE_AGENT_PANE" "$path_cmd" Enter
+    sleep 0.2
+
+    # Print bridge info in agent pane
+    local info_cmd="echo '[bridge] Agent-shell-bridge active. Session: $BRIDGE_SESSION'"
+    tmux send-keys -t "$BRIDGE_AGENT_PANE" "$info_cmd" Enter
+    sleep 0.1
+    tmux send-keys -t "$BRIDGE_AGENT_PANE" "echo '[bridge] Commands: bridge read | bridge send | bridge status'" Enter
+    sleep 0.1
+
+    # Store session info so subcommands can discover it
+    echo "$BRIDGE_SESSION" > "$BRIDGE_RUN_DIR/session_name"
+    echo "$BRIDGE_USER_PANE" > "$BRIDGE_RUN_DIR/user_pane"
+    echo "$BRIDGE_AGENT_PANE" > "$BRIDGE_RUN_DIR/agent_pane"
+    echo "$BRIDGE_HOME" > "$BRIDGE_RUN_DIR/bridge_home"
+
+    # --- Validator lock ---
+    # Store the init-time validator setting. bridge-send reads this locked
+    # value and IGNORES any env var overrides. This prevents the LLM agent
+    # from bypassing validation by doing: unset VALIDATOR; bridge send ...
+    # or: BRIDGE_VALIDATOR=true bridge send ...
+    #
+    # "locked" = a validator was configured and must be enforced
+    # "none"   = no validator configured (allow-all is intentional)
+    if [ -n "${VALIDATOR:-}" ]; then
+        echo "locked" > "$BRIDGE_RUN_DIR/validator_state"
+        echo "$VALIDATOR" > "$BRIDGE_RUN_DIR/validator_lock"
+        log_info "Validator locked: $VALIDATOR"
+    else
+        echo "none" > "$BRIDGE_RUN_DIR/validator_state"
+        echo "" > "$BRIDGE_RUN_DIR/validator_lock"
+        log_info "Validator: none (allow-all mode)"
+    fi
+
+    # Export for current process
+    export BRIDGE_SESSION BRIDGE_RUN_DIR BRIDGE_USER_PANE BRIDGE_AGENT_PANE BRIDGE_HOME
+}
+
+# ---------------------------------------------------------------------------
+# Daemon startup
+# ---------------------------------------------------------------------------
+
+start_daemon() {
+    log_info "Starting activity monitor daemon..."
+
+    # Start daemon in background
+    "$BRIDGE_HOME/bin/bridge-daemon" &
+    local daemon_pid=$!
+
+    # Wait briefly to see if it crashes immediately
+    sleep 0.3
+    if kill -0 "$daemon_pid" 2>/dev/null; then
+        log_info "Daemon started (PID: $daemon_pid)"
+    else
+        log_error "Daemon failed to start!"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Attach to session
+# ---------------------------------------------------------------------------
+
+attach_session() {
+    local session_name="${1:-${SESSION_NAME:-bridge-unknown}}"
+    local in_tmux=false
+    if [ -n "${TMUX:-}" ]; then
+        in_tmux=true
+    fi
+
+    if [ "$ATTACH_AFTER" != "true" ]; then
+        log_info "Session '$session_name' created. Attach with: tmux attach -t $session_name"
+        return
+    fi
+
+    if [ "$in_tmux" = true ]; then
+        log_info "Already in tmux -- switch to the bridge window to see both panes"
+        # Select the user pane so the user starts there
+        tmux select-pane -t "$BRIDGE_USER_PANE" 2>/dev/null || true
+    else
+        log_info "Attaching to session '$session_name'..."
+        tmux attach-session -t "$session_name"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Print summary
+# ---------------------------------------------------------------------------
+
+print_summary() {
+    local session_name="${SESSION_NAME:-bridge-unknown}"
+    cat <<SUMMARY
+
+═══════════════════════════════════════════════════════════════
+  agent-shell-bridge is ready!
+═══════════════════════════════════════════════════════════════
+  Session:      $session_name
+  Run dir:      $BRIDGE_RUN_DIR
+  User pane:    $BRIDGE_USER_PANE
+  Agent pane:   $BRIDGE_AGENT_PANE
+  Cooldown:     ${COOLDOWN_SECONDS}s
+  Validator:    ${VALIDATOR:-none (allow all)}
+
+  Agent commands:
+    bridge read              See user's terminal
+    bridge read --last 50    See last 50 lines
+    bridge read --full       See entire scrollback
+    bridge send "cmd"        Suggest a command
+    bridge status            Check if user is busy
+    bridge status --wait 10  Wait for user to be idle
+
+  The agent types suggestions into your shell.
+  You always press Enter to execute.
+═══════════════════════════════════════════════════════════════
+
+SUMMARY
+}
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+main() {
+    parse_args "$@"
+    create_session
+    configure_panes
+    setup_environment
+    inject_shell_integration
+    start_daemon
+    print_summary
+    attach_session
+}
+
+main "$@"

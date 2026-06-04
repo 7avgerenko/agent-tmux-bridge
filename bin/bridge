@@ -1,0 +1,85 @@
+#!/usr/bin/env bash
+# =============================================================================
+# bridge -- Main CLI dispatcher for agent-shell-bridge
+# =============================================================================
+# Usage: bridge <command> [args...]
+#
+# Commands:
+#   init     Create a bridge tmux session with user + agent panes
+#   read     Capture content from the user shell
+#   send     Inject a command into the user shell
+#   status   Query bridge state (blocked/ready)
+#   daemon   Start the activity monitor daemon
+#   help     Show this help
+# =============================================================================
+
+set -euo pipefail
+
+# Determine script location
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BRIDGE_HOME="$(cd "$SCRIPT_DIR/.." && pwd)"
+export BRIDGE_HOME
+
+# Source core libraries
+source "$BRIDGE_HOME/lib/logging.sh"
+source "$BRIDGE_HOME/lib/config.sh"
+source "$BRIDGE_HOME/lib/tmux-helpers.sh"
+
+# Print usage
+usage() {
+    cat <<'EOF'
+bridge -- agent-shell-bridge CLI
+
+USAGE:
+  bridge init [options]          Create a new bridge session
+  bridge read [options]          Capture content from the user shell
+  bridge send [options] <cmd>    Inject a command into the user shell
+  bridge status [options]        Query bridge state
+  bridge daemon [options]        Start the activity monitor daemon
+  bridge help                    Show this help
+
+Run 'bridge <command> --help' for command-specific options.
+
+ENVIRONMENT:
+  BRIDGE_SESSION       Session name (set by init)
+  BRIDGE_RUN_DIR       Runtime state directory
+  BRIDGE_USER_PANE      User pane ID
+  BRIDGE_AGENT_PANE     Agent pane ID
+  BRIDGE_COOLDOWN_SECONDS  Override cooldown duration
+  BRIDGE_SANITIZER     Override sanitizer path
+EOF
+}
+
+# Dispatch to subcommand
+dispatch() {
+    local cmd="${1:-help}"
+    shift || true
+
+    case "$cmd" in
+        init)
+            exec "$BRIDGE_HOME/bin/bridge-init" "$@"
+            ;;
+        read)
+            exec "$BRIDGE_HOME/bin/bridge-read" "$@"
+            ;;
+        send)
+            exec "$BRIDGE_HOME/bin/bridge-send" "$@"
+            ;;
+        status)
+            exec "$BRIDGE_HOME/bin/bridge-status" "$@"
+            ;;
+        daemon)
+            exec "$BRIDGE_HOME/bin/bridge-daemon" "$@"
+            ;;
+        help|--help|-h)
+            usage
+            ;;
+        *)
+            echo "bridge: unknown command '$cmd'" >&2
+            echo "Run 'bridge help' for usage." >&2
+            exit 1
+            ;;
+    esac
+}
+
+dispatch "$@"
