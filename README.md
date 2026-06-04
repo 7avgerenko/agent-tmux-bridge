@@ -237,3 +237,11 @@ agent-tmux-bridge/
 ## License
 
 MIT
+
+## Development
+
+```bash
+# Run tests
+./test/test-bridge.sh --quick    # 29 unit tests
+./test/test-jailbreak.sh        # 42 jailbreak tests
+```
