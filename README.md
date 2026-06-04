@@ -3,14 +3,17 @@
 A tmux-based dual-shell system where an AI agent (Claude Code, etc.) can observe your shell and suggest commands — but **you always press Enter**.
 
 ```
-┌──────────────────────────┬──────────────┐
-│   Your Shell (60%)       │ Agent (40%)  │
-│                          │              │
-│   $ ls -la               │  Claude Code │
-│   $ git status           │              │
-│   $ npm run build  ←── injected by agent │
-│   █                      │              │
-└──────────────────────────┴──────────────┘
+```text
+┌──────────────────────────────┬────────────────────┐
+│ Your Shell (60%)             │ Agent (40%)        │
+│                              │                    │
+│ $ ls -la                     │ Claude Code        │
+│ $ git status                 │                    │
+│ $ npm run build  <── injected by agent            │
+│ █                            │                    │
+│                              │                    │
+│                              │                    │
+└──────────────────────────────┴────────────────────┘
 ```
 
 ## How It Works
@@ -112,13 +115,13 @@ VALIDATOR="./config/sanitizers/validator.py --input {}"
 
 ### Built-in Validators
 
-| Validator | Behavior |
-|-----------|----------|
-| `allow-all.sh` | Pass-through (default — trust the agent) |
-| `block-all.sh` | Block everything (read-only mode) |
-| `reject-dangerous.sh` | Block `rm -rf /`, `dd`, fork bombs, etc. |
-| `require-confirm.sh` | Wrap command in `read -p "Run? [y/N]"` confirmation |
-| `validator.py` | Python template — extend with your own rules |
+| Validator              | Behavior                                                |
+| ---------------------- | ------------------------------------------------------- |
+| `allow-all.sh`         | Pass-through (default — trust the agent)                |
+| `block-all.sh`         | Block everything (read-only mode)                       |
+| `reject-dangerous.sh`  | Block `rm -rf /`, `dd`, fork bombs, etc.                |
+| `require-confirm.sh`   | Wrap command in `read -p "Run? [y/N]"` confirmation     |
+| `validator.py`         | Python template — extend with your own rules            |
 
 ### Writing Your Own Validator
 
@@ -155,16 +158,16 @@ Override via:
 
 Key settings:
 
-| Setting | Default | Description |
-|---------|---------|-------------|
-| `COOLDOWN_SECONDS` | 5 | Block agent after user types |
-| `POLL_INTERVAL_MS` | 200 | Daemon polling rate |
-| `VALIDATOR` | "" | Validator executable (empty = allow all) |
-| `VALIDATOR_TIMEOUT` | 5 | Seconds before killing hung validator |
-| `LAYOUT` | horizontal | Pane split direction |
-| `INTERACTIVE_MODE` | true | User must press Enter |
-| `BLOCK_ON_COPY_MODE` | true | Block injection during tmux copy mode |
-| `BLOCK_ON_ALTERNATE_SCREEN` | true | Block injection in vim/less/etc. |
+| Setting                     | Default      | Description                          |
+| --------------------------- | ------------ | ------------------------------------ |
+| `COOLDOWN_SECONDS`          | 5            | Block agent after user types         |
+| `POLL_INTERVAL_MS`          | 200          | Daemon polling rate                  |
+| `VALIDATOR`                 | ""           | Validator executable (allow all)     |
+| `VALIDATOR_TIMEOUT`         | 5            | Seconds before killing validator     |
+| `LAYOUT`                    | horizontal   | Pane split direction                 |
+| `INTERACTIVE_MODE`          | true         | User must press Enter                |
+| `BLOCK_ON_COPY_MODE`        | true         | Block injection during copy mode     |
+| `BLOCK_ON_ALTERNATE_SCREEN` | true         | Block injection in vim/less/man/etc. |
 
 ## Activity Detection
 
